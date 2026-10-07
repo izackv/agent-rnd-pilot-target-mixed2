@@ -2,8 +2,9 @@
 final board answers in register ``4833d53b``: Q1 four columns, Q2 dated filename, Q3 no BOM).
 
 Role parity (field-subset), cache/security headers (H-1..H-6), error matrix (E1/E2/E3/E9/E10),
-query-param ignored, the F1 whole-field J-06 scan and the F2 single-permission-path pin. Seeded
-rows come only from the ``app.data._REPORTS`` test seam; no production switch."""
+query-param ignored, the J-06 leak scan pinned to report 3's title/whole-row/id (DUA-19 F1) and
+the F2 single-permission-path pin. Seeded rows come only from the ``app.data._REPORTS`` test
+seam; no production switch."""
 
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from datetime import UTC, datetime
 import pytest
 from fastapi.testclient import TestClient
 
-from app import data, main
+from app import data, exports, main
 from app.data import Report
 from app.exports import CSV_HEADER
 from app.main import app
@@ -26,9 +27,23 @@ client = TestClient(app)
 
 EXPORT = "/api/exports/reports.csv"
 VIEWER_IDS = {"1", "2", "4"}
-# Report 3's whole field values (v2/Q1: ``restricted`` is not a column, so only these can leak).
-RESTRICTED_VALUES = (b"Payroll summary", b"finance", b"310")
+# DUA-19 F1: report 3 is pinned by its DISCRIMINATING content — title, whole emitted row and id —
+# never by non-unique field values (the old ``finance``/``310``): owner and row-count recur in
+# legitimate data, so scanning them false-fails as soon as the dataset grows. Only the ROW is
+# restricted (v2/Q1: ``restricted`` is not a column) — the id is the authoritative absence check.
+RESTRICTED_ID = "3"
+RESTRICTED_TITLE = next(r.title for r in data._REPORTS if str(r.id) == RESTRICTED_ID)
+RESTRICTED_TITLE_BYTES = RESTRICTED_TITLE.encode("utf-8")
 DATED_DISPOSITION = re.compile(r'attachment; filename="reports-(\d{4}-\d{2}-\d{2})\.csv"')
+
+
+def restricted_row() -> tuple[str, str, str, str]:
+    """Report 3's whole row exactly as the server emits it (read from the admin artifact)."""
+    admin = client.get(EXPORT, headers={"X-Role": "admin"}).content
+    hits = [tuple(row) for row in data_rows(admin) if row[0] == RESTRICTED_ID]
+    assert len(hits) == 1  # the id is unique in the admin artifact
+    return hits[0]
+
 
 # Matrix M1, viewer-classified rows (E1/E2/E3): reused by the row-set sweep and the J-06 Part B
 # artifact sweep (test-plan v2 C3 -- every 200 artifact of a viewer-classified request passes both).
@@ -79,11 +94,13 @@ def boundary_field_encodings(raw: bytes) -> list[bytes]:
 
 
 def assert_part_b_no_boundary_occurrence(raw: bytes) -> None:
-    """Part B (v2 C3): neither C-2 encoding of a restricted value occurs whole between field
+    """Part B (v2 C3): neither C-2 encoding of the restricted TITLE occurs whole between field
     boundaries. A value inside a longer field is NOT a failure -- anywhere-substring scanning is
-    explicitly not the verdict (the false-positive surface the gate corrected)."""
-    encodings = {v for v in RESTRICTED_VALUES} | {
-        b'"' + v.replace(b'"', b'""') + b'"' for v in RESTRICTED_VALUES
+    explicitly not the verdict (the false-positive surface the gate corrected). DUA-19 F1: the
+    scan targets only the row-discriminating title, never owner/rows values of the restricted
+    row, since those recur in legitimate data and false-fail on dataset growth."""
+    encodings = {RESTRICTED_TITLE_BYTES} | {
+        b'"' + RESTRICTED_TITLE_BYTES.replace(b'"', b'""') + b'"'
     }
     assert not encodings & set(boundary_field_encodings(raw))
 
@@ -161,6 +178,20 @@ def test_export_endpoint_has_exactly_one_permission_call():
     assert "restricted" not in inspect.getsource(main.api_export_reports_csv)
 
 
+def test_render_path_never_reads_or_strips_restricted():
+    # DUA-19 F4: the emit-then-strip tuple (id,title,owner,rows,restricted)[:4] is BEHAVIOUR-
+    # EQUIVALENT to correct code, so no behavioural test can see it (round-2 mutation survivor).
+    # Pin it structurally, mirroring the endpoint's single-filter spy above. Same documented
+    # caveat as that spy: the literal token may only occur in prose comments (reword those).
+    tree = ast.parse(inspect.getsource(exports.render_reports_csv))
+    assert not [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "restricted"
+    ]
+    assert "restricted" not in inspect.getsource(exports.render_reports_csv)
+
+
 def test_rendered_rows_are_what_list_reports_returns(monkeypatch):
     # A behaviour-equivalent inline ``restricted`` check would drop these rows for a viewer.
     sentinel = [Report(1, "a", "ops", 1, False), Report(9, "R", "finance", 9, True)]
@@ -179,28 +210,30 @@ def test_rendered_rows_are_what_list_reports_returns(monkeypatch):
         assert {tuple(row) for row in rows} == expected  # emitted verbatim, no post-filter
 
 
-# --- I-3 / J-06 (F1): a viewer artifact leaks no restricted data (whole-field scan) ---------------
-def test_viewer_export_leaks_no_restricted_values():
+# --- I-3 / J-06 (DUA-19 F1): a viewer artifact leaks no restricted ROW (id/row/title scan) --------
+def test_viewer_export_leaks_no_restricted_row():
     raw = client.get(EXPORT).content
-    cells = {cell for row in data_rows(raw) for cell in row}
-    assert "3" not in {row[0] for row in data_rows(raw)}
-    # Part A (F1, oracle of record): compare whole parsed cells byte-for-byte -- a substring scan
-    # false-positives on clean files (e.g. an owner "francis" or a title mentioning "310").
-    cell_bytes = {cell.encode("utf-8") for cell in cells}
-    for value in RESTRICTED_VALUES:
-        assert value not in cell_bytes
-        assert value.decode() not in cells
-    # Part B (v2 C3, supplementary, run additive after A): boundary raw-byte scan.
+    rows = data_rows(raw)
+    cells = {cell for row in rows for cell in row}
+    # Part A (DUA-19 F1, oracle of record): whole-row-scoped absence, not value-by-value.
+    # The id is the authoritative check; title and whole emitted row join it because they are
+    # THIS row's content. Non-unique values (an owner like "finance", a 10-bit "310") are NOT
+    # scanned -- they legitimately recur and the old scan false-failed the moment data grew.
+    assert RESTRICTED_ID not in {row[0] for row in rows}
+    assert restricted_row() not in {tuple(row) for row in rows}
+    assert RESTRICTED_TITLE not in cells
+    assert RESTRICTED_TITLE_BYTES not in {cell.encode("utf-8") for cell in cells}
+    # Part B (v2 C3, supplementary, run additive after A): boundary raw-byte scan of the title.
     assert_part_b_no_boundary_occurrence(raw)
 
 
 def test_part_b_precondition_dataset_has_no_colliding_value():
-    # v2 C3 soundness, dataset-anchored: no non-restricted field of the active (viewer-visible)
-    # set may equal, as a whole value, a restricted value scanned by Part B. The seeded clean
-    # file must therefore pass Part B -- and Part B is meaningless on a colliding fixture.
-    viewer_cells = {c for row in data_rows(client.get(EXPORT).content) for c in row}
-    forbidden = {v.decode() for v in RESTRICTED_VALUES}
-    assert not viewer_cells & forbidden
+    # v2 C3 soundness, dataset-anchored: no NON-RESTRICTED report may share the restricted row's
+    # TITLE as a whole value, else the title scan cannot name report 3. DUA-19 F1: this is the
+    # only collision guard needed -- owner/rows values are no longer scanned, so they may collide
+    # with legitimate reports freely (the old three-value guard false-failed as data grew).
+    titles = {row[1] for row in data_rows(client.get(EXPORT).content) if row[0] != RESTRICTED_ID}
+    assert RESTRICTED_TITLE not in titles
 
 
 @pytest.mark.parametrize("headers", M1_VIEWER_HEADERS)
@@ -211,14 +244,15 @@ def test_viewer_classified_roles_all_yield_viewer_rows(headers):
 
 @pytest.mark.parametrize("headers", M1_VIEWER_HEADERS)
 def test_every_viewer_artifact_passes_part_a_and_part_b(headers):
-    # J-06: EVERY 200 artifact of a viewer-classified request, not just the default one.
+    # J-06: EVERY 200 artifact of a viewer-classified request, not just the default one. Part A
+    # is row-scoped (DUA-19 F1): no id-3 row, no whole restricted row, no title as a bare cell.
     raw = client.get(EXPORT, headers=headers).content
     assert raw  # a 200 with CSV bytes (fail-closed classification asserted in the sweep above)
     assert_part_b_no_boundary_occurrence(raw)
-    for row in data_rows(raw):
-        assert row[0] != "3"
-    cells = {c for row in data_rows(raw) for c in row}
-    assert not cells & {v.decode() for v in RESTRICTED_VALUES}
+    rows = data_rows(raw)
+    assert RESTRICTED_ID not in {row[0] for row in rows}
+    assert restricted_row() not in {tuple(row) for row in rows}
+    assert RESTRICTED_TITLE not in {c for row in rows for c in row}
 
 
 def test_duplicate_role_headers_first_value_wins():

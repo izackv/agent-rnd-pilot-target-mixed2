@@ -5,11 +5,13 @@ The export backend (DUA-12, PR #2) is merged, so the main-path tests below drive
 server answers for the same role (D3), and the save name must be the server's dated
 Content-Disposition (v2/Q2/D4). What is pinned is the *client* contract: role in the header read
 at click time, never a query parameter; BOM prepended client-side as the last step of blob
-assembly over byte-exact API content (D3); filename from Content-Disposition when parseable, else
-`reports.csv` (§6); non-200 writes `Error <status>` into `#status` with no navigation and no
-partial file. The in-browser stub remains only for inputs the real endpoint cannot produce:
-headers it never sends (absent/malformed/filename* Content-Disposition), payloads the seed data
-cannot contain (embedded CRLF, mid-cell U+FEFF, empty row set), and non-200 responses.
+assembly over byte-exact API content (D3); filename from Content-Disposition when parseable AND
+allow-listed by the §6 shape gate (contract v2.1 / DUA-21 F1: `/^[A-Za-z0-9._-]+$/`, no leading
+dot), else the literal `reports.csv`; non-200 writes `Error <status>` into `#status` with no
+navigation and no partial file. The in-browser stub remains only for inputs the real endpoint
+cannot produce: headers it never sends (absent/malformed/filename*/hostile Content-Disposition),
+payloads the seed data cannot contain (embedded CRLF, mid-cell U+FEFF, empty row set), and
+non-200 responses.
 
 (plan v1 pre-approval "UI may proceed against the contract plus a local stub, in parallel with
 backend" applied; the stub path retires to isolation duty after the backend merge.)
@@ -152,6 +154,58 @@ def test_filename_star_is_never_read(page: Page, base_url: str) -> None:
     assert download.suggested_filename == "reports.csv"
 
 
+# contract v2.1 §6 (DUA-21 F1): the PARSED name reaches a.download only iff it matches
+# /^[A-Za-z0-9._-]+$/ with no leading dot; anything else takes the literal fallback. The hostile
+# vectors are the gate reviewer's own table from DUA-21 (quotes, ';', CR/LF, NUL, path separators).
+DATED = "reports-2026-10-07.csv"
+R = "reports.csv"  # §6 (v2.1) literal fallback
+FILENAME_GATE_CASES = [
+    pytest.param(f'attachment; filename="{DATED}"', DATED, id="dated-quoted"),
+    pytest.param(f"attachment; filename={DATED}", DATED, id="dated-unquoted"),
+    pytest.param(
+        'attachment; filename="data-2026_01.02-3.csv"', "data-2026_01.02-3.csv", id="class-chars"
+    ),
+    pytest.param('attachment; filename="x.html"', "x.html", id="other-ext"),  # §6 gates shape only
+    pytest.param('attachment; filename="../../../etc/passwd"', R, id="traversal-quoted"),
+    pytest.param('attachment; filename="../../x.csv"', R, id="traversal-rel"),
+    pytest.param('attachment; filename="C:\\Windows\\System32\\evil.bat"', R, id="win-paths"),
+    pytest.param('attachment; filename="a\r\nb.csv"', R, id="crlf"),
+    pytest.param('attachment; filename="a\x00b.csv"', R, id="nul"),
+    pytest.param('attachment; filename="evil.csv;rm -rf"', R, id="semicolon-quoted"),
+    # RFC-shape parser semantics: the UNQUOTED branch ends the name at the first ';', so what
+    # reaches the gate is "evil.csv" -- in class, accepted. Only the QUOTED form smuggles ';' in.
+    pytest.param("attachment; filename=evil.csv;rm -rf", "evil.csv", id="semicolon-unquoted"),
+    pytest.param('attachment; filename=".."', R, id="dot-dot"),
+    pytest.param("attachment; filename=..", R, id="dot-dot-unquoted"),
+    pytest.param('attachment; filename=".hidden.csv"', R, id="leading-dot"),
+    pytest.param('attachment; filename=" "', R, id="whitespace"),
+    pytest.param('attachment; filename=""', R, id="empty-quoted"),
+    pytest.param("attachment; filename*=UTF-8''x.csv", R, id="filename-star"),
+]
+
+
+@pytest.mark.parametrize(("disposition", "expected"), FILENAME_GATE_CASES)
+def test_parsed_filename_allowlist_gate(
+    page: Page, base_url: str, disposition: str, expected: str
+) -> None:
+    # Function-level table against the shipped downloadFilename: the verdict is what would be
+    # assigned to a.download, BEFORE any browser sanitiser could mask a missing allowlist.
+    page.goto(base_url + "/")
+    assert page.evaluate("(d) => downloadFilename(d)", disposition) == expected
+
+
+def test_malicious_parsed_name_never_reaches_download(page: Page, base_url: str) -> None:
+    # End-to-end arm of the DUA-21 F1 vector: a traversal name must not survive into a real
+    # download under its raw OR browser-sanitised form — the save name is the literal fallback.
+    download, _ = exported_body(
+        page,
+        base_url,
+        b"id,title,owner,rows\r\n",
+        headers={CD: 'attachment; filename="../../../etc/passwd"'},
+    )
+    assert download.suggested_filename == "reports.csv"
+
+
 def test_role_is_read_at_click_time(page: Page, base_url: str) -> None:
     # REAL endpoint: an admin click must download exactly the server's admin bytes (restricted row
     # included via the server's permission filter, never via anything the client adds).
@@ -167,6 +221,30 @@ def test_role_is_read_at_click_time(page: Page, base_url: str) -> None:
     with Path(info.value.path()).open("rb") as f:
         assert f.read() == CSV_BOM + admin_body
     assert captured.requests[-1].headers["x-role"] == "admin"
+    assert urlparse(captured.requests[-1].url).query == ""
+
+
+def test_admin_to_viewer_narrowing_without_reload_exports_narrowed_set(
+    page: Page, base_url: str
+) -> None:
+    # DUA-21 F2: pin the NARROWING direction (admin -> viewer with no reload). The PR suite only
+    # proved viewer -> admin; a stale role persistsing into the export would OVER-expose here.
+    captured = Captured()
+    watch_export_requests(page, captured)
+    viewer_body = server_body(base_url, "viewer")
+    open_page(page, base_url)
+    page.get_by_label("role").select_option("admin")  # no reload happens
+    expect(page.locator("#reports tbody tr")).to_have_count(4)
+    page.get_by_label("role").select_option("viewer")  # no reload happens
+    expect(page.locator("#reports tbody tr")).to_have_count(3)
+    with page.expect_download() as info:
+        click_export(page)
+    assert DATED_NAME.fullmatch(info.value.suggested_filename)
+    with Path(info.value.path()).open("rb") as f:
+        downloaded = f.read()
+    assert downloaded == CSV_BOM + viewer_body  # exactly the viewer bytes, nothing wider
+    assert b"Payroll summary" not in downloaded  # report 3 (admin-only) is absent
+    assert captured.requests[-1].headers["x-role"] == "viewer"  # click-time role, not the stale one
     assert urlparse(captured.requests[-1].url).query == ""
 
 

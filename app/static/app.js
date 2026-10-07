@@ -21,12 +21,17 @@ document.getElementById("role").addEventListener("change", load);
 // as the last step of blob assembly, from one constant — never request-derived, never server-side.
 const CSV_BOM = new Uint8Array([0xef, 0xbb, 0xbf]);
 
+// Allowed save-name characters: contract v2.1 §6 (DUA-21 F1) — accept only this shape, never
+// sanitise or rewrite anything else; a leading dot (including "..") is rejected outright.
+const SAFE_NAME = /^[A-Za-z0-9._-]+$/;
+
 function downloadFilename(disposition) {
-  // §6: the Content-Disposition filename when parseable (H-2/D4: quoted, ASCII, no filename*),
-  // else the literal fallback. An unparseable header (absent or malformed) takes the fallback.
+  // §6 (v2.1): the Content-Disposition filename iff it matches SAFE_NAME with no leading dot
+  // (H-2/D4: quoted, ASCII, no filename*), else the literal fallback. An unparseable header
+  // (absent or malformed) takes the fallback. Accept-or-fall-back: nothing in between.
   const m = /;\s*filename=(?:"([^"]*)"|([^";]+))/i.exec(disposition || "");
   const name = m ? (m[1] ?? m[2]).trim() : "";
-  return name || "reports.csv";
+  return SAFE_NAME.test(name) && !name.startsWith(".") ? name : "reports.csv";
 }
 
 async function exportCsv() {
