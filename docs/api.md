@@ -12,20 +12,24 @@ authentication, chosen so permission paths can be tested without an identity pro
 
 ## CSV export
 
-`GET /api/exports/reports.csv` streams no data: it is buffered and returns a UTF-8 CSV body with a
-leading **BOM** so a double-clicked download renders accents, non-Latin scripts and emoji correctly
-in Windows Excel. Columns are `id,title,owner,rows,restricted` for **both** roles (identical
-schema); `rows`/`id` are plain integers and `restricted` is lowercase `true`/`false`. Records are
-CRLF-terminated; a CR/LF inside a field value is preserved byte-for-byte inside a quoted field.
-String values that begin with `=`, `+`, `-`, `@`, TAB, CR or LF are prefixed with a single `'` so a
-spreadsheet treats them as inert text rather than a formula. The row set uses the same permission
-filter as `GET /api/reports` (`X-Role` header only; anything not exactly `admin` is a viewer), so a
-download never contains a restricted report the requester may not see. Responses carry
-`Cache-Control: no-store` and `Vary: X-Role` so a permission-filtered body is never served from a
-cache to a different role. An empty permitted set returns 200 with the header row only.
+`GET /api/exports/reports.csv` streams no data: it is buffered and returns a **plain UTF-8** CSV
+body with **no BOM** (per the final board answers, register `4833d53b` Q3; the BOM belongs only to
+the browser download path). Columns are `id,title,owner,rows` for **both** roles (identical schema;
+Q1) — `restricted` is never a column, so the CSV is a field-subset of `GET /api/reports` and roles
+differ only in row membership. `id` and `rows` are plain integers. Records are CRLF-terminated; a
+CR/LF inside a field value is preserved byte-for-byte inside a quoted field. String values that
+begin with `=`, `+`, `-`, `@`, TAB, CR or LF are prefixed with a single `'` so a spreadsheet treats
+them as inert text rather than a formula. The row set uses the same permission filter as
+`GET /api/reports` (`X-Role` header only; anything not exactly `admin` is a viewer), so a download
+never contains a restricted report the requester may not see. Responses carry
+`Content-Disposition: attachment; filename="reports-YYYY-MM-DD.csv"` (Q2 — the server's UTC date at
+response time, never steerable by the request), plus `Cache-Control: no-store` and `Vary: X-Role` so
+a permission-filtered body is never served from a cache to a different role. An empty permitted set
+returns 200 with the header row only.
 
-To read the file from another consumer, decode with `utf-8-sig` to drop the BOM, and open with
-`newline=""` so embedded newlines are not translated:
+To read the API response from another consumer, decode as `utf-8` and open with `newline=""` so
+embedded newlines are not translated (`utf-8-sig` also works and is the right choice for
+BOM-prefixed browser downloads — it is a no-op on these BOM-free bytes):
 
 ```python
 import csv, io, urllib.request

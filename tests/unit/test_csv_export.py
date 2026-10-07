@@ -1,7 +1,8 @@
-"""Unit tests for the pure CSV writer (contract v1.1 §3), with no HTTP layer.
+"""Unit tests for the pure CSV writer (contract v1.1 §3, board register 4833d53b Q1/Q3), with no
+HTTP layer.
 
 Covers: header-once (U-1), the six brief cell classes round-tripped (U-2), C-11 neutralisation
-matrix (U-3), lowercase ``restricted`` (U-4) and single-BOM emission (U-5)."""
+matrix (U-3), ``restricted`` never emitted (U-4) and BOM-free server bytes (U-5)."""
 
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from app import exports
 from app.data import Report
 
 CSV_PATH = Path(exports.__file__)
-ORACLE_HEADER = ["id", "title", "owner", "rows", "restricted"]
+ORACLE_HEADER = ["id", "title", "owner", "rows"]
 
 
 def parse(body: str) -> list[list[str]]:
@@ -63,7 +64,7 @@ def test_header_only_for_zero_rows():
 def test_header_is_first_record_and_constant_columns():
     parsed = parse(exports.render_reports_csv([Report(9, "t", "o", 1, True)]))
     assert parsed[0] == ORACLE_HEADER
-    assert all(len(row) == 5 for row in parsed)
+    assert all(len(row) == 4 for row in parsed)
 
 
 # --- U-2: byte-exact round-trip over the cell classes (parsed-cell equality) -------------------
@@ -80,7 +81,7 @@ def test_crlf_inside_field_is_byte_preserved():
     # C-5/D1: an embedded CRLF stays CRLF inside the quoted field; records stay CRLF-delimited.
     body = render_one("a\r\nb").encode("utf-8")
     assert b'"a\r\nb"' in body  # field bytes preserved verbatim
-    records = body[len(exports.CSV_BOM.encode("utf-8")) :].split(b"\r\n")
+    records = body.split(b"\r\n")  # v2/Q3: no BOM to skip before the first record
     assert records[0] == ",".join(ORACLE_HEADER).encode()
 
 
@@ -131,20 +132,22 @@ def test_single_call_site_of_neutralise():
     assert "neutralise" in inspect.getsource(exports._field)
 
 
-# --- U-4: restricted rendered lowercase (parity with JSON) ----------------------------------------
-def test_restricted_lowercase_boolean():
-    for flag, word in ((True, "true"), (False, "false")):
-        parsed = parse(exports.render_reports_csv([Report(1, "t", "o", 5, flag)]))
-        assert parsed[1][4] == word
+# --- U-4: restricted is never emitted (v2/Q1) ----------------------------------------------------
+def test_restricted_flag_never_changes_rendered_body():
+    # The column does not exist at all: emit-nothing, not emit-then-strip.
+    with_flag = exports.render_reports_csv([Report(1, "t", "o", 5, True)])
+    without = exports.render_reports_csv([Report(1, "t", "o", 5, False)])
+    assert with_flag == without
+    parsed = parse(with_flag)
+    assert parsed[0] == ORACLE_HEADER and all(len(row) == 4 for row in parsed)
 
 
-# --- U-5: BOM emitted once from the module constant ----------------------------------------------
-def test_bom_prefix_once_and_matches_constant():
+# --- U-5: server bytes are plain UTF-8, no BOM (v2/Q3) --------------------------------------------
+def test_no_bom_in_server_body():
     body = render_one("plain")
     raw = body.encode("utf-8")
-    assert raw.startswith(b"\xef\xbb\xbf")
-    assert body.startswith(exports.CSV_BOM)
-    assert exports.CSV_BOM == "\ufeff"
-    # no BOM reappears anywhere after the single prefix
-    assert body.count(exports.CSV_BOM) == 1
-    assert raw.count(b"\xef\xbb\xbf") == 1
+    assert not raw.startswith(b"\xef\xbb\xbf")
+    assert b"\xef\xbb\xbf" not in raw
+    assert "\ufeff" not in body
+    # the BOM constant is gone from the server path entirely (browser download path only)
+    assert not hasattr(exports, "CSV_BOM")

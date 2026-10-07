@@ -1,7 +1,9 @@
 """CSV rendering for the report export endpoints.
 
-Implements contract v1.1 §3 (clauses C-1..C-11) for ``app``-level exports. No HTTP, no data
-access: callers pass the already-permission-filtered rows that ``app.data.list_reports`` returned.
+Implements contract v1.1 §3 (clauses C-1..C-11) as amended by the final board answers
+(register ``4833d53b``, contract v2 Q1/Q3): the server emits **no BOM** and the columns are
+exactly ``id,title,owner,rows`` for both roles. No HTTP, no data access: callers pass the
+already-permission-filtered rows that ``app.data.list_reports`` returned.
 """
 
 from __future__ import annotations
@@ -12,11 +14,9 @@ from io import StringIO
 
 from app.data import Report
 
-# C-4: the BOM is a single module-level constant and is never request-controllable.
-CSV_BOM = "\ufeff"
-
-# C-7: identical columns for every role (parity with Report.to_dict()).
-CSV_HEADER = ("id", "title", "owner", "rows", "restricted")
+# C-7 (v2/Q1): identical columns for every role; ``restricted`` is never emitted, so roles differ
+# only in row membership, never in schema (a field-subset of the JSON endpoint).
+CSV_HEADER = ("id", "title", "owner", "rows")
 
 # C-11: a string field is "active" iff its first character is one of these.
 ACTIVE_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
@@ -40,24 +40,20 @@ def _field(value: object) -> object:
 
 
 def render_reports_csv(reports: Iterable[Report]) -> str:
-    """Build the export body as one ``str``: BOM + header + one record per report (C-6).
+    """Build the export body as one ``str``: header + one record per report (C-6).
 
     ``csv.writer`` emits CRLF records and quotes a field iff it contains the delimiter, a quote,
     CR or LF (C-1/C-2). The buffer is opened ``newline=""`` so embedded CR/LF/CRLF pass through
     unchanged, and this function returns a ``str`` for the caller to encode exactly once (C-5).
+    V2/Q3: no BOM here -- the server response is plain UTF-8; the BOM belongs to the browser
+    download path only.
     """
     buffer = StringIO(newline="")  # C-5: forbid newline translation in the text buffer
     writer = csv.writer(buffer, lineterminator="\r\n")  # C-1: stdlib writer, CRLF terminator
 
     writer.writerow([_field(cell) for cell in CSV_HEADER])
     for report in reports:
-        cells = (
-            report.id,
-            report.title,
-            report.owner,
-            report.rows,
-            "true" if report.restricted else "false",  # C-8: lowercase, JSON parity
-        )
+        cells = (report.id, report.title, report.owner, report.rows)
         writer.writerow([_field(cell) for cell in cells])
 
-    return CSV_BOM + buffer.getvalue()
+    return buffer.getvalue()
