@@ -14,3 +14,4 @@ authentication, chosen so permission paths can be tested without an identity pro
 | ID | Journey | Test |
 |---|---|---|
 | J-01 | Viewer opens the reports page and sees permitted reports; admin sees the restricted one too | `tests/e2e/test_journey.py` |
+| UI export control | "Export CSV" button on `/` fetches the export route with the current role in `X-Role`, then downloads it as a CSV file (BOM prepended client-side only; API bytes stay BOM-free); non-200 shows `Error <status>` in the status region | `tests/e2e/test_export_control.py` |
