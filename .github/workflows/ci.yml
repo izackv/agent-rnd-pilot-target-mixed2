@@ -38,8 +38,11 @@ jobs:
       - run: uv sync --frozen
       - run: uv run playwright install --with-deps chromium
       - run: uv run pytest tests/e2e -q
+      - name: full suite in one invocation (collection across all test dirs)
+        run: uv run pytest -q
   docs:
     runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'   # the waiver line lives in the PR body; post-merge pushes have no PR body
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }

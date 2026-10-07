@@ -1,7 +1,7 @@
 # Production arrangement on CT 206 (D-11). Image tag is injected by the release workflow.
 services:
   pilot-target:
-    image: ${PILOT_TARGET_IMAGE:-ghcr.io/izackv/agent-rnd-pilot-target:production}
+    image: ${PILOT_TARGET_IMAGE:-ghcr.io/izackv/agent-rnd-pilot-target-mixed2:production}
     container_name: pilot-target
     restart: unless-stopped
     ports:
