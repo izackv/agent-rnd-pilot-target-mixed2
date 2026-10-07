@@ -30,6 +30,63 @@ VIEWER_IDS = {"1", "2", "4"}
 RESTRICTED_VALUES = (b"Payroll summary", b"finance", b"310")
 DATED_DISPOSITION = re.compile(r'attachment; filename="reports-(\d{4}-\d{2}-\d{2})\.csv"')
 
+# Matrix M1, viewer-classified rows (E1/E2/E3): reused by the row-set sweep and the J-06 Part B
+# artifact sweep (test-plan v2 C3 -- every 200 artifact of a viewer-classified request passes both).
+M1_VIEWER_HEADERS = [
+    pytest.param({}, id="E1-absent"),
+    pytest.param({"X-Role": "viewer"}, id="viewer"),
+    pytest.param({"X-Role": "root"}, id="E2-root"),
+    pytest.param({"X-Role": "Admin"}, id="E2-Admin"),
+    pytest.param({"X-Role": "ADMIN"}, id="E2-ADMIN"),
+    pytest.param({"X-Role": ""}, id="E2-empty"),
+    pytest.param({"X-Role": " admin"}, id="E2-padded"),
+]
+
+
+def boundary_field_encodings(raw: bytes) -> list[bytes]:
+    """RFC 4180 field encodings split on bytes with quote-state tracking (BOF/EOF boundaries).
+
+    Deliberately NOT the ``csv`` parser: Part B exists to cross-check bytes a broken parser
+    might hide (test-plan v2 C3 -- bad quoting, stray bytes outside records)."""
+    fields: list[bytes] = []
+    buf = bytearray()
+    in_q = False
+    i = 0
+    while i < len(raw):
+        c = raw[i]
+        if in_q:
+            buf.append(c)
+            if c == 0x22:  # closing quote, or a doubled one that stays inside
+                if raw[i + 1 : i + 2] == b'"':
+                    buf.append(0x22)
+                    i += 1
+                else:
+                    in_q = False
+        elif c == 0x22:
+            in_q = True
+            buf.append(c)
+        elif c in (0x2C, 0x0D):  # field separator, or CR of the CRLF record separator
+            fields.append(bytes(buf))
+            buf = bytearray()
+            if c == 0x0D:
+                i += 1  # consume the LF as part of the boundary
+        else:
+            buf.append(c)
+        i += 1
+    if buf:
+        fields.append(bytes(buf))
+    return fields
+
+
+def assert_part_b_no_boundary_occurrence(raw: bytes) -> None:
+    """Part B (v2 C3): neither C-2 encoding of a restricted value occurs whole between field
+    boundaries. A value inside a longer field is NOT a failure -- anywhere-substring scanning is
+    explicitly not the verdict (the false-positive surface the gate corrected)."""
+    encodings = {v for v in RESTRICTED_VALUES} | {
+        b'"' + v.replace(b'"', b'""') + b'"' for v in RESTRICTED_VALUES
+    }
+    assert not encodings & set(boundary_field_encodings(raw))
+
 
 def parse_bytes(raw: bytes) -> list[list[str]]:
     assert not raw.startswith(b"\xef\xbb\xbf") and b"\xef\xbb\xbf" not in raw  # v2/Q3: no BOM
@@ -127,31 +184,41 @@ def test_viewer_export_leaks_no_restricted_values():
     raw = client.get(EXPORT).content
     cells = {cell for row in data_rows(raw) for cell in row}
     assert "3" not in {row[0] for row in data_rows(raw)}
-    # F1 (test-plan-v2 §22): compare whole parsed cells byte-for-byte -- a substring scan
+    # Part A (F1, oracle of record): compare whole parsed cells byte-for-byte -- a substring scan
     # false-positives on clean files (e.g. an owner "francis" or a title mentioning "310").
     cell_bytes = {cell.encode("utf-8") for cell in cells}
     for value in RESTRICTED_VALUES:
         assert value not in cell_bytes
         assert value.decode() not in cells
+    # Part B (v2 C3, supplementary, run additive after A): boundary raw-byte scan.
+    assert_part_b_no_boundary_occurrence(raw)
 
 
-# --- I-5: full M1 role sweep, all viewer-classified (E1/E2/E3, fail-closed) ---------------------
-@pytest.mark.parametrize(
-    "headers",
-    [
-        {},  # E1 absent
-        {"X-Role": "viewer"},
-        {"X-Role": "root"},  # E2
-        {"X-Role": "Admin"},  # E2 wrong case
-        {"X-Role": "ADMIN"},
-        {"X-Role": ""},  # E2 empty
-        {"X-Role": " admin"},  # E2 padded
-    ],
-    ids=["E1-absent", "viewer", "E2-root", "E2-Admin", "E2-ADMIN", "E2-empty", "E2-padded"],
-)
+def test_part_b_precondition_dataset_has_no_colliding_value():
+    # v2 C3 soundness, dataset-anchored: no non-restricted field of the active (viewer-visible)
+    # set may equal, as a whole value, a restricted value scanned by Part B. The seeded clean
+    # file must therefore pass Part B -- and Part B is meaningless on a colliding fixture.
+    viewer_cells = {c for row in data_rows(client.get(EXPORT).content) for c in row}
+    forbidden = {v.decode() for v in RESTRICTED_VALUES}
+    assert not viewer_cells & forbidden
+
+
+@pytest.mark.parametrize("headers", M1_VIEWER_HEADERS)
 def test_viewer_classified_roles_all_yield_viewer_rows(headers):
     rows = data_rows(client.get(EXPORT, headers=headers).content)
     assert {row[0] for row in rows} == VIEWER_IDS
+
+
+@pytest.mark.parametrize("headers", M1_VIEWER_HEADERS)
+def test_every_viewer_artifact_passes_part_a_and_part_b(headers):
+    # J-06: EVERY 200 artifact of a viewer-classified request, not just the default one.
+    raw = client.get(EXPORT, headers=headers).content
+    assert raw  # a 200 with CSV bytes (fail-closed classification asserted in the sweep above)
+    assert_part_b_no_boundary_occurrence(raw)
+    for row in data_rows(raw):
+        assert row[0] != "3"
+    cells = {c for row in data_rows(raw) for c in row}
+    assert not cells & {v.decode() for v in RESTRICTED_VALUES}
 
 
 def test_duplicate_role_headers_first_value_wins():
@@ -180,9 +247,22 @@ def test_unknown_query_param_ignored():
 # --- I-7 / E9: empty permitted set returns header-only bytes (order exact) -----------------------
 def test_empty_set_header_only(monkeypatch):
     monkeypatch.setattr(data, "_REPORTS", [])
-    r = client.get(EXPORT)
-    assert r.status_code == 200
-    assert r.content == ",".join(CSV_HEADER).encode("utf-8") + b"\r\n"
+    for headers in ({}, {"X-Role": "admin"}):  # v3 Δ2: the dated name is asserted for E9 too
+        r = client.get(EXPORT, headers=headers)
+        assert r.status_code == 200
+        m = DATED_DISPOSITION.fullmatch(r.headers["content-disposition"])
+        assert m and m.group(1) == utc_filename_date()  # H-2 applies to every 200, empty included
+        assert r.content == ",".join(CSV_HEADER).encode("utf-8") + b"\r\n"
+
+
+# --- v3 Δ3 / D3(a): a BOM switch must not exist; ?bom= (or any switch) is request-inert ----------
+def test_bom_switch_is_request_inert():
+    plain = client.get(EXPORT, headers={"X-Role": "admin"})
+    for url in (EXPORT + "?bom=true", EXPORT + "?bom=1", EXPORT + "?BOM=true"):
+        r = client.get(url, headers={"X-Role": "admin"})
+        assert r.status_code == plain.status_code  # ignored, not a second behaviour (D3(a))
+        assert r.content == plain.content  # identical bytes -- no server-side BOM path
+        assert b"\xef\xbb\xbf" not in r.content
 
 
 # --- I-8: round-trip the cell classes through the real route via the _REPORTS seam ---------------
