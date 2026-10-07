@@ -46,3 +46,4 @@ rows = list(csv.reader(io.StringIO(raw.decode("utf-8-sig"), newline="")))
 | J-01 | Viewer opens the reports page and sees permitted reports; admin sees the restricted one too | `tests/e2e/test_journey.py` |
 | J-05 | API list export matches the JSON endpoint for the same role (per role; set equality) | (brief J3) `tests/integration/test_export_api.py` |
 | J-06 | A viewer-classified CSV download never contains restricted data | (brief J4a) `tests/integration/test_export_api.py` |
+| UI export control | "Export CSV" button on `/` fetches the export route with the current role in `X-Role`, then downloads it as a CSV file (BOM prepended client-side only; API bytes stay BOM-free); non-200 shows `Error <status>` in the status region | `tests/e2e/test_export_control.py` |
