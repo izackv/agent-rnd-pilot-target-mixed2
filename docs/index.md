@@ -30,7 +30,7 @@ The same data is available over HTTP without the button; the API bytes are plain
 (the download's BOM is added in the browser):
 
 ```
-curl -H "X-Role: admin" http://localhost:8000/api/exports/reports.csv -o reports.csv
+curl -H "X-Role: admin" http://localhost:8000/api/exports/reports.csv -o report-copy.csv
 ```
 
 Encoding mechanics, headers and programmatic read recipes: `api.md`.

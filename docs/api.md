@@ -38,7 +38,7 @@ import csv, io, urllib.request
 
 raw = urllib.request.urlopen(url).read()
 rows = list(csv.reader(io.StringIO(raw.decode("utf-8"), newline="")))
-# pandas: pandas.read_csv("reports.csv", encoding="utf-8")
+# pandas: pandas.read_csv(path_to_saved_csv, encoding="utf-8")
 ```
 
 A file saved from the browser download contains byte-identical data preceded by the three-byte
